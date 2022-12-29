@@ -27,58 +27,27 @@ const (
 )
 
 var (
-	dir        = flag.String("dir", ".", "output file dictionary")
 	typeNames  = flag.String("type", "", "comma-separated list of type names; must be set")
-	output     = flag.String("output", "", "output file name; (default \"./<typename>_lina.go\")")
-	lock       = flag.String("lock", "getter", "whether to use lock")
-	gen        = flag.String("gen", "getter,setter", "whether to gen getter or setter")
-	userGetter = flag.String("gettmpl", "", "user getter template path")
-	userSetter = flag.String("settmpl", "", "user setter template path")
+	output     = ""
 	getterTmpl = "getter"
 	setterTmpl = "setter"
 	tmpl       = map[string]string{
-		"getter": `func ({{.Receiver}} *{{.Struct}}) {{.UpperField}}() {{.Type}} {
-	return {{.Receiver}}.{{.Field}}
-}
-`,
 		"setter": `func ({{.Receiver}} *{{.Struct}}) DoNotUseThisToSet{{.UpperField}}({{.Field}} {{.Type}}) {
 	{{.Receiver}}.{{.Field}} = {{.Field}}
 }
 `,
-		"lockGetter": `func ({{.Receiver}} *{{.Struct}}) {{.UpperField}}() {{.Type}} {
+		"getter": `func ({{.Receiver}} *{{.Struct}}) {{.UpperField}}() {{.Type}} {
 	{{.Receiver}}.RLock()
 	defer {{.Receiver}}.RUnlock()
 	return {{.Receiver}}.{{.Field}}
-}
-`,
-		"lockSetter": `func ({{.Receiver}} *{{.Struct}}) Set{{.UpperField}}({{.Field}} {{.Type}}) {
-	{{.Receiver}}.Lock()
-	defer {{.Receiver}}.Unlock()
-	{{.Receiver}}.{{.Field}} = {{.Field}}
-}
-`,
-		"lock": `func ({{.Receiver}} *{{.Struct}}) Lock() {
-	{{.Receiver}}.{{.Lock}}.Lock()
-}
-`,
-		"unlock": `func ({{.Receiver}} *{{.Struct}}) Unlock() {
-	{{.Receiver}}.{{.Lock}}.Unlock()
-}
-`,
-		"rlock": `func ({{.Receiver}} *{{.Struct}}) RLock() {
-	{{.Receiver}}.{{.Lock}}.RLock()
-}
-`,
-		"runlock": `func ({{.Receiver}} *{{.Struct}}) RUnlock() {
-	{{.Receiver}}.{{.Lock}}.RUnlock()
 }
 `,
 	}
 )
 
 var (
-	SETTER = false
-	GETTER = false
+	SETTER = true
+	GETTER = true
 )
 
 // Usage is a replacement usage function for the flags package.
@@ -97,49 +66,7 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-	if !isDirectory(*dir) {
-		log.Fatalf("%q is not a directory", *dir)
-	}
 
-	locks := strings.Split(*lock, ",")
-	for _, item := range locks {
-		if item == "getter" {
-			getterTmpl = "lockGetter"
-		} else if item == "setter" {
-			setterTmpl = "lockSetter"
-		}
-	}
-
-	if *userGetter != "" {
-		if bs, err := os.ReadFile(*userGetter); err == nil {
-			tmpl[getterTmpl] = string(bs)
-		} else {
-			log.Fatal(err)
-		}
-	}
-
-	if *userSetter != "" {
-		if bs, err := os.ReadFile(*userSetter); err == nil {
-			tmpl[setterTmpl] = string(bs)
-		} else {
-			log.Fatal(err)
-		}
-	}
-
-	gens := strings.Split(*gen, ",")
-	for _, m := range gens {
-		if m == "no" {
-			GETTER = false
-			SETTER = false
-			break
-		} else if m == "getter" {
-			GETTER = true
-		} else if m == "setter" {
-			SETTER = true
-		} else {
-			log.Fatalf("-gen unknow arg %q", m)
-		}
-	}
 	types := strings.Split(*typeNames, ",")
 
 	// We accept either one directory or a list of files. Which do we have?
@@ -163,10 +90,10 @@ func main() {
 	for i, typeName := range types {
 		g.generate(typeName)
 		// AccessWrite to file.
-		if *output == "" {
-			*output = fmt.Sprintf("%s_lina.go", types[i])
+		if output == "" {
+			output = fmt.Sprintf("%s_lina.go", types[i])
 		}
-		outputName := filepath.Join(*dir, strings.ToLower(*output))
+		outputName := filepath.Join(".", strings.ToLower(output))
 		buf := g.buf[typeName]
 		var src = (buf).Bytes()
 
@@ -176,15 +103,6 @@ func main() {
 		}
 	}
 
-}
-
-// isDirectory reports whether the named file is a directory.
-func isDirectory(name string) bool {
-	info, err := os.Stat(name)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return info.IsDir()
 }
 
 // Generator holds the state of the analysis. Primarily used to buffer
@@ -274,10 +192,7 @@ func (g *Generator) generate(typeName string) {
 				}
 				g.Printf(stName, "package %s\n", g.pkg.name)
 				g.Printf(stName, "\n")
-				lockName := ""
-				if len(*lock) > 0 {
-					lockName = "mutex"
-				}
+
 				for _, field := range info {
 					for _, access := range field.Access {
 						switch access {
@@ -289,11 +204,7 @@ func (g *Generator) generate(typeName string) {
 							if GETTER {
 								g.Printf(stName, "%s\n", genGetter(stName, field.Name, field.Type))
 							}
-						case LockTag:
-							g.Printf(stName, "%s\n", genLocker(stName, field.Name, field.Type, lockName))
-							g.Printf(stName, "%s\n", genRLocker(stName, field.Name, field.Type, lockName))
-							g.Printf(stName, "%s\n", genUnlocker(stName, field.Name, field.Type, lockName))
-							g.Printf(stName, "%s\n", genRUnlocker(stName, field.Name, field.Type, lockName))
+
 						case SkipTag:
 							continue
 						default:
@@ -334,6 +245,9 @@ func ParseStruct(file *ast.File, fileSet *token.FileSet, tagName string) (struct
 		fileInfos := make([]StructFieldInfo, 0)
 
 		for _, field := range s.Fields.List {
+			if len(field.Names) == 0 {
+				continue
+			}
 			name := field.Names[0].Name
 			info := StructFieldInfo{Name: name}
 			var typeNameBuf bytes.Buffer
@@ -378,22 +292,6 @@ func genGetter(structName, fieldName, typeName string) string {
 }
 func genSetter(structName, fieldName, typeName string) string {
 	return genFunc(setterTmpl, structName, fieldName, typeName, "")
-}
-
-func genLocker(structName, fieldName, typeName, lockName string) string {
-	return genFunc("lock", structName, fieldName, typeName, lockName)
-}
-
-func genUnlocker(structName, fieldName, typeName, lockName string) string {
-	return genFunc("unlock", structName, fieldName, typeName, lockName)
-}
-
-func genRLocker(structName, fieldName, typeName, lockName string) string {
-	return genFunc("rlock", structName, fieldName, typeName, lockName)
-}
-
-func genRUnlocker(structName, fieldName, typeName, lockName string) string {
-	return genFunc("runlock", structName, fieldName, typeName, lockName)
 }
 
 func genFunc(funcName, structName, fieldName, typeName, lockName string) string {
